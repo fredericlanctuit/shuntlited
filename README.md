@@ -22,7 +22,7 @@ Existing proxies (LiteLLM, OpenRouter) handle routing but not privacy or context
 
 ## What ShuntLited Does
 ```
-Your interface (Kiro)
+Your interface (html)
         │
         ▼
 ┌───────────────────────┐
