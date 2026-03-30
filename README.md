@@ -1,211 +1,328 @@
 # ShuntLited
 
-> **Your conversations stay yours. You pay nothing. You never start from scratch.**
+<img width="1440" height="720" alt="image" src="https://github.com/user-attachments/assets/fe3bf15e-dae6-4a95-abc1-16a0039bbfde" />
 
-A Rust binary that sits between your AI interface and cloud providers.  
-It routes intelligently to free tiers, masks sensitive data before transit, and distills past sessions into reusable context.
+# ShuntLited
 
----
-
-## The Problem
-
-Cloud AI is powerful but has three structural flaws nobody solves together:
-
-- **It costs money** the moment you exceed free limits
-- **It collects your data** by design — your prompts train their models
-- **It forgets everything** between sessions — you restart from zero every time
-
-Local solutions (Ollama, llama.cpp) require hardware most people don't have.  
-Existing proxies (LiteLLM, OpenRouter) handle routing but not privacy or context.
+> A single Rust binary acting as a local interceptor between your AI chat interface
+> and cloud LLM providers — frugal by design, private by architecture.
 
 ---
 
-## What ShuntLited Does
+## Why ShuntLited?
+
+Three problems affect anyone using AI chat tools daily:
+
+**Cost** — Free-tier quotas run out fast. Paid APIs add up. ShuntLited rotates across
+free providers automatically, so you get more tokens before spending a cent.
+
+**Privacy** — Every prompt sent to a cloud provider feeds their training pipeline.
+ShuntLited masks sensitive entities locally before any data leaves your machine.
+
+**Memory** — LLMs forget everything between sessions. ShuntLited distils your
+conversation history into a structured context package injected at session start.
+
+---
+
+## Architecture
+
+Three components, two execution modes:
 ```
-Your interface (html)
-        │
-        ▼
-┌───────────────────────┐
-│      ShuntLited       │
-│                       │
-│  1. Context Distiller │  ← injects memory from past sessions
-│  2. Prompt Shield     │  ← masks sensitive data before transit
-│  3. Frugal Router     │  ← routes to best free-tier provider
-└───────────┬───────────┘
-            │
-            ▼
-   Cloud Providers
-   (Groq, Mistral, Google, Cerebras...)
-   → they never see your raw sensitive data
-   → they never see your conversation history
+Chat client → [Prompt Shield] → [Frugal Router] → Free LLM provider
+                                      ↓  (async)
+                             [Context Distiller]
+                                      ↓
+                          ~/.shuntlited/context/latest.json
+                                      ↓  (injected at next session start)
+                                 Chat client
 ```
 
----
+### Critical path (synchronous, per-request)
 
-## Three Modules
+**Prompt Shield** and **Frugal Router** live on the hot path.
+Every request passes through both before reaching the provider.
+Response comes back through the same pipeline.
 
-### 1. Frugal Router
-Routes each request to the most appropriate free-tier provider based on available quotas and performance scores. Falls back automatically if a provider is down or quota is exhausted.
+### Async path (session-bound)
 
-**Universal slots:**
-| Slot | Purpose | Priority order |
-|------|---------|----------------|
-| `gpt-build` | Code, refactoring | Cerebras → Groq → SambaNova → OpenRouter |
-| `gpt-plan` | Reasoning, architecture | Groq → SambaNova → OpenRouter → Cerebras |
-| `gpt-chat` | Conversation, daily use | OpenRouter → Scaleway → Groq → Mistral |
-| `gpt-distill` | Context distillation only | Google → Mistral → Groq |
-
-No hardcoded model lists — the catalogue updates automatically from provider `/v1/models` endpoints.
+**Context Distiller** is completely decoupled from the critical path.
+It runs out-of-band: triggered by session close, inactivity timeout, or manual call.
+It writes a JSONL file; the router reads it at startup. Neither knows about the other's internals.
 
 ---
 
-### 2. Prompt Shield
-Masks sensitive data before it leaves your machine using token substitution.
+## Module 1 — Frugal Router
+
+An HTTP proxy listening on `localhost:8080` with an OpenAI-compatible API
+(`POST /v1/chat/completions`). Routes each request to the best available
+free provider based on live quota tracking and health checks.
+
+**Provider rotation example (BUILD slot):**
+Cerebras → Groq → SambaNova → OpenRouter
+
+**No hardcoded model lists.** Provider catalogues are fetched and cached from
+`/v1/models` endpoints (TTL: 12 h). Quota state is tracked via `x-ratelimit-*`
+response headers and local counters.
+
+**Fallback:** if the primary provider returns 429 or fails, the router
+immediately tries the next one in the rotation. No user-visible error.
+
+**Four universal slots** define intent, not a specific model:
+
+| Slot | Intent |
+|------|--------|
+| `gpt-build` | Code generation, structured output |
+| `gpt-plan` | Reasoning, planning, long context |
+| `gpt-chat` | Conversational, low latency |
+| `gpt-distill` | Distillation calls (lightweight model) |
+
+Slot selection is client-driven via the `model` field in the request payload.
+
+---
+
+## Module 2 — Prompt Shield
+
+Detects sensitive entities **locally** before any request leaves the machine.
+Uses token substitution — not encryption. RGPD-compliant by design, not by policy.
+
+**Example:**
 ```
-"My client Dupont owes €50,000 to Martin"
-        │
-        ▼  (local substitution)
-"My client [ENTITY_1] owes [AMOUNT_1] to [ENTITY_2]"
-        │
-        ▼  (sent to provider)
-"[ENTITY_1] should negotiate a payment plan with [ENTITY_2]"
-        │
-        ▼  (local reinjection)
-"Dupont should negotiate a payment plan with Martin"
+Input:  "Mon client Dupont doit 50 000 € à Martin"
+Sent:   "Mon client [PERSON_1] doit [MONTANT_1] à [PERSON_2]"
+Received: "... [PERSON_1] devra régler [MONTANT_1] ..."
+Output: "... Dupont devra régler 50 000 € ..."
 ```
 
-The provider reasons on the structure. It never sees the sensitive values.  
-**GDPR-compliant by design, not by privacy policy.**
+The substitution map lives in memory for the duration of the request. Nothing is persisted.
+
+### Safe to mask (whitelist — v0.2 scope)
+
+| Entity type | Why safe |
+|-------------|----------|
+| Person names (first + last) | No syntactic constraints; neutral to LLM reasoning |
+| Email addresses | Fixed format; placeholder preserves length |
+| Phone numbers | Regex-stable; isolated from logic |
+| IBAN / account numbers | Never used in reasoning chains |
+| Postal addresses | Low semantic weight |
+
+### Mask with caution (later versions)
+
+| Entity type | Risk |
+|-------------|------|
+| Dates (`15 mai 2024`) | LLM may do temporal reasoning ("in 3 days"); masking breaks it |
+| Monetary amounts | Some models compute; masking blocks arithmetic |
+| Company names | Model may have brand-specific knowledge it relies on |
+| Contract references | Often used as logical keys; masking makes response useless |
+
+**Implementation note:** Gender-aware placeholders (`[HOMME_NOM_1]`, `[FEMME_NOM_2]`)
+are planned to preserve grammatical agreement in French-language prompts.
 
 ---
 
-### 3. Context Distiller
-Transforms your past conversations into reusable structured context.
+## Module 3 — Context Distiller
 
-Reads Kiro's local IndexedDB exports (JSON), sends them to a lightweight
-distillation model (Gemini Flash Lite — 1M token context window, free tier),
-and produces a `context-packet`:
+Reads local conversation exports (JSON from Kiro or compatible chat interfaces),
+sends a summary request to the `gpt-distill` slot (Gemini Flash Lite or equivalent),
+and generates a structured context package:
+```json
+{
+  "RULES":     ["invariants the user has established"],
+  "STATE":     "current project state summary",
+  "DECISIONS": [{ "ts": "2024-09-26", "choice": "...", "rationale": "..." }],
+  "NEXT":      ["planned for next session"]
+}
 ```
-RULES      → your invariants (never changes)
-STATE      → current project or conversation state
-DECISIONS  → timestamped choices with reasoning
-NEXT       → what was planned for the next session
+
+This package is stored as `~/.shuntlited/context/latest.json` and injected
+as the first system message at session start.
+
+**This is structured semantic memory, not RAG vector retrieval.**
+No embeddings. No similarity search. Simple key-based lookup.
+
+### Distillation cadence (v0.1 default)
+
+- Triggered at session close (SIGINT or inactivity timeout: 5 min)
+- Overridable via `POST /distill?force=1`
+- Configurable interval: `SHUNT_DISTILL_INTERVAL=15` (messages)
+
+---
+
+## Storage
+
+**No database for context packages.** LanceDB was evaluated and rejected as
+over-engineered for this workload (a few dozen KB of JSON per day, key-based access only).
+
+Context packages are stored as JSONL files:
+```
+~/.shuntlited/context/
+  latest.json          ← injected at session start
+  archive/
+    2024-09-26T14-32.json
+    2024-09-25T09-15.json
 ```
 
-This packet is injected as a system prompt at the start of each new session.  
-**You never explain your context again.**
-
-> Why not RAG? A vector RAG retrieves fragments. The Context Distiller
-> extracts structure — rules and decisions, not raw text.
+Quota counters and provider state use `sled` (embedded key-value, ~1 MiB RAM,
+ACID writes, zero external dependencies).
 
 ---
 
-## Philosophy
+## Configuration
+```toml
+[router]
+listen = "127.0.0.1:8080"
 
-**FROG** — the internal compass for every technical decision:
+[[providers]]
+name     = "groq"
+endpoint = "https://api.groq.com/openai/v1"
+api_key  = "${GROQ_API_KEY}"
+slots    = ["gpt-chat", "gpt-build"]
+rate_limit = 50
 
-| | Value | Concrete application |
-|--|-------|---------------------|
-| **F** | Frugality | Free-tier first, small model for distillation, zero runtime dependency |
-| **R** | Resilience | Auto-fallback, graceful degradation, works without internet for masking |
-| **O** | Open-source | Public Rust binary, open context-packet format |
-| **G** | Gratis | Zero cost by default — paid providers are an explicit user choice |
+[[providers]]
+name     = "cerebras"
+endpoint = "https://api.cerebras.ai/v1"
+api_key  = "${CEREBRAS_API_KEY}"
+slots    = ["gpt-build"]
+rate_limit = 30
+
+[shield]
+enabled  = true
+entities = ["person", "email", "phone", "iban"]
+
+[distill]
+enabled  = true
+path     = "~/.shuntlited/context"
+interval = 15
+slot     = "gpt-distill"
+```
 
 ---
 
-## Who Is This For
+## Philosophy — FROG
 
-**The teenager learning with AI**  
-No credit card. No subscription. No questions ending up in a training
-dataset somewhere.
-> *Stop paying to learn. Your questions stay yours.*
+**F**rugal · **R**esilient · **O**pen source · **G**ratuit
 
-**The busy person with too much on their mind**  
-Already hit the 40-message limit on ChatGPT. Doesn't want to think
-about quotas.
-> *Your head is already full. No need to add a bill.*
-
-**The freelancer handling client data**  
-Needs AI in their daily workflow but can't send client data to OpenAI
-without thinking twice.
-> *AI in your workflow. Your client data stays with you.*
+- Free tier first. Paid = explicit user choice.
+- One binary. No runtime dependencies. No Docker required.
+- Deployable on a 4 GB RAM VPS or any laptop.
+- Open format for context packages (plain JSON) — you own your memory.
 
 ---
 
-## Tech Stack
+## Technology stack
 
-| Component | Choice | Why |
-|-----------|--------|-----|
-| Language | Rust (Edition 2021+) | Memory precision, autonomous binary, transparent proxy latency |
-| Async runtime | Tokio | Concurrent requests without overhead |
-| HTTP server | Axum | Minimal, fast, idiomatic Rust |
-| Masking engine | Custom (Rust) | Zero external dependency, auditable |
-| Serialization | Serde + JSON | Open context-packet format |
-| Config | TOML | Human-readable, non-developer friendly |
-| Distribution | Single binary | Zero install, zero runtime, zero `pip install` |
+| Layer | Technology | Rationale |
+|-------|-----------|-----------|
+| Runtime | Rust + Tokio | Single binary, zero-runtime-deps |
+| HTTP server | Axum | Middleware-native, async |
+| HTTP client | reqwest | Async, TLS built-in |
+| Config | TOML + env vars | Human-readable, no secrets in files |
+| Context storage | JSONL files | Zero deps, git/rsync-friendly |
+| Quota state | sled | Embedded KV, 1 MiB RAM, ACID |
+| Logging | tracing + daily rolling file | Structured, lightweight |
 
 ---
 
 ## Roadmap
 
-| Version | Content | Status |
-|---------|---------|--------|
-| `v0.1` | Frugal Router — HTTP proxy, 4 slots, provider rotation | 🚧 |
-| `v0.2` | Dynamic catalogue — auto-discovery from `/v1/models` | 📋 |
-| `v0.3` | Context Distiller — Kiro JSON parsing, context-packet format | 📋 |
-| `v0.4` | Prompt Shield — token masking, local reinjection | 📋 |
-| `v1.0` | Full stack — `install.sh`, user doc, Kiro integration | 📋 |
-
-Each version is usable standalone. v0.1 does not block v0.4.
-
----
-
-## vs. Existing Tools
-
-| | ShuntLited | LiteLLM | OpenRouter | Ollama |
-|--|-----------|---------|------------|--------|
-| Free-tier routing | ✅ | ✅ | ✅ | ❌ |
-| Sensitive data masking | ✅ | ❌ | ❌ | N/A |
-| Persistent context | ✅ | ❌ | ❌ | ❌ |
-| Single binary | ✅ | ❌ | N/A | ✅ |
-| No GPU required | ✅ | ✅ | ✅ | ⚠️ |
-| GDPR by design | ✅ | ⚠️ | ⚠️ | ✅ |
-| Non-developer friendly | ✅ | ❌ | ❌ | ❌ |
+| Version | Scope |
+|---------|-------|
+| **v0.1** | HTTP proxy + single provider + TOML config + logs + `/ready` health check |
+| **v0.2** | Frugal router: multi-provider rotation + quota tracking via `x-ratelimit-*` |
+| **v0.3** | Prompt Shield: PII whitelist (person, email, phone, IBAN) |
+| **v0.4** | Context Distiller: session-based distillation + JSONL storage |
+| **v0.5** | CLI: `shuntlited status` showing quotas, active provider, recent errors |
+| **v1.0** | Stable config format + `/metrics` endpoint (Prometheus) |
 
 ---
 
-## Contributing
+## Known limitations
 
-This project is in early design phase. The most valuable contributions
-right now:
-
-- **Architecture feedback** — open an issue, challenge the design
-- **Rust expertise** — Tokio, Axum, NER crates, token masking
-- **Real-world use cases** — what sensitive data patterns should
-  Prompt Shield handle?
-- **Provider knowledge** — free-tier limits, quirks, undocumented
-  endpoints
-
-No code required to contribute at this stage.  
-A good issue is worth more than a rushed PR.
+- Provider catalogues change frequently; keeping the rotation list accurate requires maintenance.
+- Token substitution can degrade LLM reasoning for complex entities (dates, amounts). Empirical testing per use case is required.
+- No multi-user support. Designed for single-user, local deployment.
+- API keys must be managed manually in environment variables or config.
 
 ---
 
 ## Status
 
-**Early design — no code yet.**  
-The architecture is defined. The roadmap is set.  
-Looking for early feedback and contributors.
-
-If you're building something in this space, open an issue. Let's talk.
+Phase: **early design + Cargo scaffold**
+`cargo build` compiles. No functional HTTP server yet.
+Contributions and issue reports welcome.
 
 ---
 
 ## License
 
-MIT — do whatever you want, keep the attribution.
+MIT
 
 ---
 
-*Built on the belief that useful AI should not require a credit card
-or a privacy waiver.*
+*ShuntLited is not affiliated with any LLM provider.*
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## 
+
+---
+
+## ShuntLited — Pour qui, pourquoi
+
+### L'IA gratuite a une limite. ShuntLited la repousse.
+
+Tu utilises ChatGPT, Claude ou Gemini tous les jours.  
+À un moment tu tombes sur ce message : *"Vous avez atteint votre limite de messages."*  
+Et tu n'as pas de carte bancaire — ou tu ne veux pas payer.
+
+**ShuntLited intercepte tes requêtes avant qu'elles arrivent au cloud,  
+les redirige automatiquement vers le meilleur fournisseur gratuit disponible,  
+et recommence quand le quota est épuisé.**
+
+Zéro configuration complexe. Lance le binaire, pointe ton client IA dessus, c'est tout.
+
+---
+
+### Tes données restent chez toi.
+
+Tu es freelance. Tu gères des dossiers clients. Tu ne veux pas que les noms,
+les montants et les adresses de tes clients alimentent les données d'entraînement d'un fournisseur américain.
+
+**ShuntLited détecte localement les informations sensibles dans tes prompts
+et les remplace par des marqueurs neutres avant l'envoi.**  
+La réponse revient avec les vraies valeurs réinjectées.  
+Aucune donnée personnelle ne quitte ta machine.
+
+Conforme RGPD par architecture — pas par promesse de confidentialité.
+
+---
+
+### L'IA se souvient de toi d'une session à l'autre.
+
+Tu reprends un projet après deux jours. L'IA ne sait plus rien de ce que vous avez fait.  
+Tu perds 10 minutes à tout réexpliquer.
+
+**ShuntLited distille l'historique de tes conversations en un paquet de contexte structuré
+— tes règles, l'état du projet, les décisions prises, la prochaine étape —
+et l'injecte automatiquement au démarrage de chaque nouvelle session.**
+
+Ce n'est pas de la recherche vectorielle. C'est de la mémoire structurée, lisible, portable.  
+Ton contexte est un fichier JSON. Tu le possèdes.
+
+---
+
+### Trois profils, un seul outil
+
+**L'ado qui apprend** — pas de carte bancaire, quotas épuisés avant la fin du devoir.  
+ShuntLited tourne silencieusement en fond, redistribue entre Groq, Cerebras, SambaNova.  
+La limite disparaît de ta vue.
+
+**La personne surchargée** — 40 messages ChatGPT partis en réunion de travail,  
+et il reste encore la moitié de la journée.  
+ShuntLited bascule vers un autre fournisseur sans que tu aies à changer d'interface.
+
+**Le freelance soucieux du RGPD** — les noms de tes clients ne voyagent pas en clair.  
+Tu peux utiliser l'IA pour ton travail sans compromettre leur confidentialité.
+
+---
+
+*Un seul binaire. Aucune dépendance. Tourne sur un VPS à 4 Go ou sur ton laptop.*  
+*Gratuit d'abord. Payant = ton choix explicite.*
