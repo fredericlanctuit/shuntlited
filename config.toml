@@ -1,0 +1,14 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[provider]
+name     = "groq"
+base_url = "https://api.groq.com/openai/v1"
+model    = "llama-3.3-70b-versatile"
+
+[slots]
+build   = "llama-3.3-70b-versatile"
+plan    = "llama-3.3-70b-versatile"
+chat    = "llama-3.3-70b-versatile"
+distill = "llama-3.1-8b-instant"

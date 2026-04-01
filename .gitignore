@@ -1,7 +1,6 @@
 /target
-Cargo.lock
 .aider*
 /.tmp
 *.sled
 /docs
-secret.env
+secrets.env
