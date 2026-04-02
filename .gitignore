@@ -4,3 +4,4 @@
 *.sled
 /docs
 secrets.env
+TASK.md
