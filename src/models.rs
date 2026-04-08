@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-// ── Requête entrante (Kiro → ShuntLited) ────────────────────────────────────
+// -- Requete entrante (client -> ShuntLited)
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -21,7 +21,7 @@ pub struct Message {
     pub content: String,
 }
 
-// ── Requête sortante (ShuntLited → Groq) ────────────────────────────────────
+// -- Requete sortante (ShuntLited -> provider)
 
 #[derive(Debug, Serialize)]
 pub struct UpstreamRequest<'a> {
@@ -33,7 +33,7 @@ pub struct UpstreamRequest<'a> {
     pub temperature: Option<f32>,
 }
 
-// ── Réponse Groq → ShuntLited → Kiro ────────────────────────────────────────
+// -- Reponse provider -> ShuntLited -> client
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChatResponse {
@@ -60,7 +60,7 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
-// ── Réponse d'erreur standardisée ───────────────────────────────────────────
+// -- Reponse d'erreur standardisee (format ShuntLited)
 
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
@@ -71,14 +71,25 @@ pub struct ErrorResponse {
 pub struct ErrorDetail {
     pub message: String,
     pub r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl ErrorResponse {
-    pub fn new(message: impl Into<String>, error_type: impl Into<String>) -> Self {
+    pub fn new(
+        message: impl Into<String>,
+        error_type: impl Into<String>,
+        provider: Option<String>,
+        retry_after_seconds: Option<u64>,
+    ) -> Self {
         Self {
             error: ErrorDetail {
                 message: message.into(),
                 r#type: error_type.into(),
+                provider,
+                retry_after_seconds,
             },
         }
     }
