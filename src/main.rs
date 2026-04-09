@@ -2,9 +2,10 @@ mod config;
 mod models;
 mod providers;
 mod router;
+mod savings;
 
 use std::sync::Arc;
-use axum::{routing::{get, post}, Router};
+use axum::{routing::{get, post}, Router, response::Json as AxumJson};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use router::AppState;
@@ -39,6 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = sled::open(&db_path)?;
     info!(path = %db_path.display(), "Sled ouvert");
 
+    // -- Bootstrap reference_pricing.json si absent
+    savings::ensure_reference_pricing();
+
     // -- Etat partage
 
     let state = Arc::new(AppState {
@@ -52,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/ready",               get(router::health_check))
         .route("/v1/chat/completions", post(router::chat_completions))
+        .route("/data/routing.json",   get(routing_json_handler))
         .with_state(state);
 
     // -- Bind
@@ -60,4 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(addr = %bind, "En ecoute");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn routing_json_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    let active: Vec<String> = state.config.secrets.active_providers
+        .iter().cloned().collect();
+    let routing = savings::generate_routing_json(&state.db, &active);
+    AxumJson(routing)
 }

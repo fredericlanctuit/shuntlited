@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use crate::config::{AppConfig, effective_providers};
 use crate::models::{ChatRequest, ChatResponse, ErrorResponse, UpstreamRequest};
 use crate::providers::get_provider_meta;
+use crate::savings::{write_quota, accumulate_savings, write_routing_json};
 
 // -- Etat partage injecte par Axum
 
@@ -186,6 +187,9 @@ pub async fn chat_completions(
                     continue;
                 }
 
+                // -- Capturer headers avant consommation du body
+                let resp_headers = resp.headers().clone();
+
                 match resp.json::<ChatResponse>().await {
                     Ok(chat_resp) => {
                         info!(
@@ -194,6 +198,40 @@ pub async fn chat_completions(
                             tokens = ?chat_resp.usage.as_ref().map(|u| u.total_tokens),
                             "<- reponse recue"
                         );
+
+                        // -- Quota tracking : lire headers et ecrire dans sled
+                        let rpd = resp_headers
+                            .get(meta.header_rpd.unwrap_or(""))
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok());
+                        let rpm = meta.header_rpm.and_then(|h| {
+                            resp_headers.get(h)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.parse::<u64>().ok())
+                        });
+                        let tpd = meta.header_tpd.and_then(|h| {
+                            resp_headers.get(h)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.parse::<u64>().ok())
+                        });
+                        write_quota(&state.db, provider_name, rpd, rpm, tpd);
+
+                        // -- Savings counter
+                        if let Some(usage) = &chat_resp.usage {
+                            accumulate_savings(
+                                &state.db,
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                                provider_name,
+                                &chat_resp.model,
+                            );
+                        }
+
+                        // -- Mise a jour routing.json
+                        let active: Vec<String> = state.config.secrets.active_providers
+                            .iter().cloned().collect();
+                        write_routing_json(&state.db, &active);
+
                         return (StatusCode::OK, Json(chat_resp)).into_response();
                     }
                     Err(e) => {

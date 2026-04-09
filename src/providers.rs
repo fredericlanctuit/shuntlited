@@ -28,8 +28,8 @@ const CEREBRAS: ProviderMeta = ProviderMeta {
 const SAMBANOVA: ProviderMeta = ProviderMeta {
     base_url: "https://api.sambanova.ai/v1",
     default_model: "Meta-Llama-3.3-70B-Instruct",
-    header_rpd: Some("x-ratelimit-remaining-requests-day"), // TODO: confirmer par curl
-    header_rpm: Some("x-ratelimit-remaining-requests-minute"), // TODO: confirmer par curl
+    header_rpd: Some("x-ratelimit-remaining-requests-day"),
+    header_rpm: None,
     header_tpd: None,
 };
 
